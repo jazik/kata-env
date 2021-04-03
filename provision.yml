@@ -1,0 +1,107 @@
+---
+- hosts: all
+  become: yes
+  become_user: root
+  tasks:
+
+  - name: Install basics
+    dnf:
+      name:
+        - grubby
+        - git
+        - container-selinux
+        - selinux-policy-base
+        - jq
+        - https://rpm.rancher.io/k3s/stable/common/centos/7/noarch/k3s-selinux-0.2-1.el7_8.noarch.rpm
+      disable_gpg_check: true
+      state: latest
+
+  - name: Switch to cgroup v1
+    command: grubby --update-kernel=ALL --args="systemd.unified_cgroup_hierarchy=0"
+
+  - name: Reboot
+    reboot:
+
+  - name: Download k3s install script
+    ansible.builtin.get_url:
+      url: https://get.k3s.io
+      dest: /tmp/k3s.sh
+
+  - name: Install k3s
+    environment:
+      INSTALL_K3S_VERSION: v1.17.2+k3s1
+    ansible.builtin.shell:
+      cmd: cat /tmp/k3s.sh | sh -s --
+
+  - name: Make sure k3s is running
+    service:
+      name: k3s
+      state: started
+
+  - name: Make config.toml backup
+    command:  cp /var/lib/rancher/k3s/agent/etc/containerd/config.toml /var/lib/rancher/k3s/agent/etc/containerd/config.toml.base
+
+  - name: Kata RBAC
+    command: kubectl apply -f https://raw.githubusercontent.com/kata-containers/packaging/master/kata-deploy/kata-rbac/base/kata-rbac.yaml
+
+  - name: Get current node-labeler manifest
+    shell: kubectl get clusterrole node-labeler -o yaml > /tmp/node-labeler.yaml
+
+  - name: Modify node-labeler
+    blockinfile:
+      dest: /tmp/node-labeler.yaml
+      block: |
+        - apiGroups:
+          - coordination.k8s.io
+          resources:
+          - leases
+          verbs:
+          - get
+          - list
+
+  - name: Apply new node-labeler manifest
+    command: kubectl replace -f /tmp/node-labeler.yaml
+
+  - name: Remove temparary node-labeler manifest file
+    file:
+      path: /tmp/node-labeler.yaml
+      state: absent
+
+  - name: Install kata
+    command: kubectl apply -k github.com/kata-containers/packaging/kata-deploy/kata-deploy/overlays/k3s
+
+  - name: Wait for kata to be ready
+    command: kubectl get -n kube-system daemonset kata-deploy -o{{ "=" }}jsonpath{{ "=" }}'{.status.numberReady}{"\n"}'
+    register: cmd_res
+    retries: 40
+    delay: 30
+    until: cmd_res.stdout.find("1") != -1
+
+  - name: Add RuntimeClass
+    command: kubectl apply -f https://raw.githubusercontent.com/kata-containers/packaging/master/kata-deploy/k8s-1.14/kata-qemu-runtimeClass.yaml
+
+  - name: Deploy test application
+    command: kubectl apply -f https://raw.githubusercontent.com/kata-containers/packaging/master/kata-deploy/examples/test-deploy-kata-qemu.yaml
+
+  - name: Wait for application to be running
+    shell: kubectl get deploy php-apache-kata-qemu -o{{ "=" }}jsonpath{{ "=" }}'{.status.readyReplicas}{"\n"}'
+    register: cmd_res
+    retries: 10
+    delay: 30
+    until: cmd_res.stdout.find("1") != -1
+
+  - name: Get test app IP
+    shell: kubectl get service/php-apache-kata-qemu -o{{ "=" }}jsonpath{{ "=" }}'{.spec.clusterIP}'
+    register: cmd_res
+
+  - name: Store test app IP
+    set_fact:
+      test_app_ip: "{{ cmd_res.stdout }}"
+
+  - name: Check if app is running
+    shell: curl {{ test_app_ip }}
+    register: cmd_res
+    failed_when: cmd_res.stdout.find("OK!") == -1
+
+  - name: Delete test app
+    shell: kubectl delete deployment.apps/php-apache-kata-qemu service/php-apache-kata-qemu
